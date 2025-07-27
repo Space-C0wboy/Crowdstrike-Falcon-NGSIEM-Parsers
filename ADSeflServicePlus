@@ -1,0 +1,114 @@
+// =====================================================================
+// PARSER FOR ADSSP LOGS - CrowdStrike Falcon SIEM (RFC 5424 w/ KV pairs)
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// STEP 1: PRE-PARSE SYSLOG HEADER AND EXTRACT EMBEDDED KEY-VALUE PAIRS
+// ---------------------------------------------------------------------
+
+// Parse RFC 5424 syslog header fields: priority, version, timestamp, hostname, app, procid, msgid, and raw message
+| regex("^<(?<log.syslog.priority>\\d+)>(?<log.syslog.version>\\d+) (?<ts>[^ ]+) (?<host.name>[^ ]+) (?<log.syslog.appname>[^ ]+) (?<log.syslog.procid>[^ ]+) (?<log.syslog.msgid>[^ ]+) (?<message>.+)", strict=false)
+
+// Parse and normalize timestamp to ECS @timestamp
+| @timestamp := findTimestamp(timezone="UTC", field=ts)
+| drop(ts)  // Remove temporary timestamp field
+
+// Extract bracketed key-value pairs from the syslog message payload
+| regex("\\[(?<pairs>[^\\]]+)\\]", field=message, repeat=true)
+| kvParse(pairs, "Vendor.")  // Prefix all extracted KV pairs with "Vendor."
+
+// Normalize keys with spaces or unusual characters for consistent access
+| rename([
+    ["Vendor.LOGIN NAME", "Vendor.LOGIN_NAME"],
+    ["Vendor.ACCESS IP", "Vendor.IP"],
+    ["Vendor.ACCESS HOST NAME", "Vendor.HOST"],
+    ["Vendor.USER_AGENT", "Vendor.USER_AGENT"],
+    ["Vendor.ACTION_NAME", "Vendor.ACTION_NAME"],
+    ["Vendor.DOMAIN_NAME", "Vendor.DOMAIN_NAME"],
+    ["Vendor.NOTIFICATION SENT TO", "Vendor.NOTIFICATION_SENT_TO"],
+    ["Vendor.USERS LIST", "Vendor.USERS_LIST"]
+])
+
+// ---------------------------------------------------------------------
+// STEP 2: STATIC METADATA
+// ---------------------------------------------------------------------
+
+| Parser.version := "1.0.0"
+| Vendor := "adssp"                     // System name: Advanced Directory Secure Service Provider
+| event.module := "auth"               // ECS event module: authentication events
+| ecs.version := "8.11.0"
+| Cps.version := "1.0.0"
+
+// ---------------------------------------------------------------------
+// STEP 3: ECS EVENT NORMALIZATION
+// ---------------------------------------------------------------------
+
+| event.kind := "event"
+| event.category[0] := "iam"           // Identity and access management
+| event.category[1] := "authentication"
+
+// Normalize event.type based on known ACTION_NAME values
+| case {
+    Vendor.ACTION_NAME = "Password Login" 
+        | event.type[0] := "authentication";
+    Vendor.ACTION_NAME = "Reset Password"
+        | event.type[0] := "change";
+    Vendor.ACTION_NAME = "Change Password"
+        | event.type[0] := "change";
+    Vendor.ACTION_NAME = "User Must Change Password"
+        | event.type[0] := "user";
+    Vendor.ACTION_NAME = "Derestrict Users"
+        | event.type[0] := "admin";
+    *
+        | event.type[0] := "info";  // Default if unknown
+}
+
+// Derive event outcome from STATUS field
+| case {
+    Vendor.STATUS = "Success"
+        | event.outcome := "success";
+    Vendor.STATUS =~ /denied|blocked|incorrect|invalid|failure/i
+        | event.outcome := "failure";
+    *
+        | event.outcome := "unknown";
+}
+
+// ---------------------------------------------------------------------
+// STEP 4: ECS FIELD MAPPINGS
+// ---------------------------------------------------------------------
+
+| user.name := Vendor.LOGIN_NAME
+| source.ip := Vendor.IP
+| source.address := Vendor.HOST
+| user_agent.original := Vendor.USER_AGENT
+| event.action := Vendor.ACTION_NAME
+| dns.domain := lower(Vendor.DOMAIN_NAME)  // Normalize domain to lowercase
+
+// Handle mail notification fields if present
+| case {
+    Vendor.NOTIFICATION_SENT_TO != ""
+        | splitString(Vendor.NOTIFICATION_SENT_TO, by=",", as="email.to.address");
+    *;
+}
+
+// Handle list of related users (if applicable)
+| case {
+    Vendor.USERS_LIST != ""
+        | splitString(Vendor.USERS_LIST, by=",", as="related.user");
+    *;
+}
+
+// ---------------------------------------------------------------------
+// STEP 5: VENDOR-SPECIFIC FIELD PRESERVATION
+// ---------------------------------------------------------------------
+
+// Keep ADSSP-specific fields that don’t map directly to ECS
+| vendor.policy_name := Vendor.POLICY_NAME
+| vendor.access_mode := Vendor.ACCESS_MODE
+| vendor.ca_rule_name := Vendor.CA_RULE_NAME
+| vendor.status_message := Vendor.STATUS_MESSAGE
+| vendor.authenticator_config := Vendor.AUTHENTICATOR_CONFIG_NAME
+| vendor.audit_id := Vendor.AUDIT_ID
+| vendor.audit_type := Vendor.AUDIT_TYPE_ID
+| vendor.endpoint_module := Vendor.ENDPOINT_MODULE_ID
+| vendor.notification_type := Vendor.NOTIFICATION_TYPE
